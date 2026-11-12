@@ -192,17 +192,17 @@
     return rest;
   }
   const nativeTabsCreate = browser.tabs.create.bind(browser.tabs);
-  // The extension opens an OAuth login tab on every (temporary) install; the installer already bootstraps tokens from Claude Code
+  // The extension opens an OAuth login tab on install and from its login button. Anthropic's OAuth
+  // rejects Firefox redirects, so instead pull Claude Code's current token (firefox-token-injector.js).
+  // Only swallow the tab when that leaves an unexpired token; otherwise let the login page open so the
+  // click visibly does something.
   const OAUTH_LOGIN_URL = /^https:\/\/claude\.ai\/(login|oauth\/authorize)/;
   async function hasUsableTokens() {
-    const stored = await browser.storage.local.get(['accessToken']);
-    if (stored.accessToken) return true;
-    try {
-      const file = await (await fetch(chrome.runtime.getURL('firefox-injected-tokens.json'))).json();
-      return Boolean(file.accessToken);
-    } catch (_) {
-      return false;
+    if (typeof globalThis.__claudeFirefoxSyncTokens === 'function') {
+      try { return await globalThis.__claudeFirefoxSyncTokens(); } catch (_) {}
     }
+    const stored = await browser.storage.local.get(['accessToken', 'tokenExpiry']);
+    return Boolean(stored.accessToken && (!stored.tokenExpiry || Date.now() < stored.tokenExpiry));
   }
   chrome.tabs.create = promiseToCallback(async function (info) {
     if (info && typeof info.url === 'string' && OAUTH_LOGIN_URL.test(info.url) && await hasUsableTokens()) {

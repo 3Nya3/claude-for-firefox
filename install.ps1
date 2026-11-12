@@ -242,8 +242,8 @@ public class CredHelper {
         }
 
         $tokenObj = @{
+            # refreshToken deliberately omitted: the extension would rotate it and log Claude Code out
             accessToken  = $oauth.accessToken
-            refreshToken = $oauth.refreshToken
             expiresAt    = $oauth.expiresAt
         }
         $tokenObj | ConvertTo-Json | Set-Content -Path $tokenFile -Encoding UTF8
@@ -418,7 +418,7 @@ if (-not $oauth.accessToken) {
 $tokenDir = Split-Path $tokenFile
 if (-not (Test-Path $tokenDir)) { New-Item -ItemType Directory -Force -Path $tokenDir | Out-Null }
 
-@{ accessToken = $oauth.accessToken; refreshToken = $oauth.refreshToken; expiresAt = $oauth.expiresAt } |
+@{ accessToken = $oauth.accessToken; expiresAt = $oauth.expiresAt } |
     ConvertTo-Json | Set-Content -Path $tokenFile -Encoding UTF8
 
 Write-Host 'Tokens refreshed successfully.'

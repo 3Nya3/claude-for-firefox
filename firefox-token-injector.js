@@ -1,14 +1,21 @@
 /**
  * Firefox Token Lifecycle Manager
  *
- * Solves the OAuth incompatibility where Anthropic's server only accepts
- * chrome-extension:// redirect URIs. Bootstraps tokens from Claude Code's
- * existing session via a bundled JSON file written by the installer.
+ * Anthropic's OAuth server only accepts chrome-extension:// redirect URIs, so the
+ * extension cannot log in by itself in Firefox. Instead it borrows Claude Code's
+ * session: the native host reads Claude Code's credentials on request
+ * (`get_tokens`) and hands back the current access token. Each time Claude Code
+ * refreshes its token, the extension picks up the new one on its next sync.
+ *
+ * The refresh token is never stored. With a refresh token present, the extension's
+ * own OAuth code rotates it, which invalidates Claude Code's copy and logs it out.
+ * Without one, the extension simply uses the access token until it expires and
+ * this manager swaps in Claude Code's newer token.
  *
  * Token storage keys in chrome.storage.local:
- *   accessToken, refreshToken, tokenExpiry
+ *   accessToken, tokenExpiry   (refreshToken is actively removed)
  *
- * Token source file (bundled by installer):
+ * Fallback source (written by the installer / refresh-tokens script):
  *   firefox-injected-tokens.json
  */
 (function () {
@@ -18,115 +25,79 @@
   if (typeof browser === 'undefined') return;
 
   const LOG_PREFIX = '[Claude Firefox Token]';
+  const NATIVE_HOST = 'com.anthropic.claude_browser_extension';
   const TOKEN_FILE = chrome.runtime.getURL('firefox-injected-tokens.json');
-  const REFRESH_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
-  const EXPIRY_BUFFER_MS = 10 * 60 * 1000;   // 10 minutes
+  const SYNC_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes
   const INITIAL_DELAY_MS = 500;
 
-  function log(...args) {
-    console.log(LOG_PREFIX, ...args);
+  const log = (...args) => console.log(LOG_PREFIX, ...args);
+  const warn = (...args) => console.warn(LOG_PREFIX, ...args);
+  const error = (...args) => console.error(LOG_PREFIX, ...args);
+
+  function normalize(data) {
+    if (!data || !data.accessToken) return null;
+    const expiry = typeof data.expiresAt === 'number' ? data.expiresAt
+      : (typeof data.tokenExpiry === 'number' ? data.tokenExpiry : 0);
+    return { accessToken: data.accessToken, tokenExpiry: expiry };
   }
 
-  function warn(...args) {
-    console.warn(LOG_PREFIX, ...args);
-  }
-
-  function error(...args) {
-    console.error(LOG_PREFIX, ...args);
-  }
-
-  /**
-   * Read tokens from the bundled JSON file written by the installer.
-   * Returns { accessToken, refreshToken, tokenExpiry } or null.
-   */
-  async function readTokenFile() {
+  /** Ask the native host for Claude Code's current tokens. */
+  async function readHostTokens() {
     try {
-      const resp = await fetch(TOKEN_FILE);
-      if (!resp.ok) {
-        warn('Token file not found or unreadable:', resp.status);
-        return null;
-      }
-      const data = await resp.json();
-      if (!data.accessToken) {
-        warn('Token file present but missing accessToken');
-        return null;
-      }
-      return {
-        accessToken: data.accessToken,
-        refreshToken: data.refreshToken || '',
-        tokenExpiry: typeof data.expiresAt === 'number'
-          ? data.expiresAt
-          : (typeof data.tokenExpiry === 'number' ? data.tokenExpiry : 0),
-      };
+      const resp = await browser.runtime.sendNativeMessage(NATIVE_HOST, { type: 'get_tokens' });
+      if (resp && resp.error) warn('Native host:', resp.error);
+      return normalize(resp);
     } catch (e) {
-      warn('Failed to read token file:', e.message);
+      warn('Native host token lookup failed:', e.message);
       return null;
     }
   }
 
-  /**
-   * Retrieve current tokens from extension storage.
-   */
-  function getStoredTokens() {
-    return new Promise((resolve) => {
-      chrome.storage.local.get(
-        ['accessToken', 'refreshToken', 'tokenExpiry'],
-        (result) => resolve(result || {})
-      );
-    });
-  }
-
-  /**
-   * Persist tokens into extension storage.
-   */
-  function storeTokens(tokens) {
-    return new Promise((resolve) => {
-      chrome.storage.local.set(
-        {
-          accessToken: tokens.accessToken,
-          refreshToken: tokens.refreshToken,
-          tokenExpiry: tokens.tokenExpiry,
-        },
-        () => {
-          log('Tokens written to storage');
-          resolve();
-        }
-      );
-    });
-  }
-
-  /**
-   * Returns true if the stored token is missing or expires within the buffer window.
-   */
-  function isExpiredOrMissing(stored) {
-    if (!stored || !stored.accessToken) return true;
-    if (!stored.tokenExpiry) return false; // no expiry info, assume valid
-    return Date.now() >= stored.tokenExpiry - EXPIRY_BUFFER_MS;
-  }
-
-  /**
-   * Try to inject tokens from the bundled file if storage is empty or stale.
-   */
-  async function ensureTokens() {
-    const stored = await getStoredTokens();
-    if (!isExpiredOrMissing(stored)) return;
-
-    log(stored.accessToken ? 'Token expiring soon, refreshing from file' : 'No valid token in storage, bootstrapping from file');
-
-    const fileTokens = await readTokenFile();
-    if (!fileTokens) {
-      warn('Cannot bootstrap tokens -- token file unavailable. Run the installer.');
-      return;
+  /** Read tokens from the bundled JSON file written by the installer. */
+  async function readTokenFile() {
+    try {
+      const resp = await fetch(TOKEN_FILE);
+      if (!resp.ok) return null;
+      return normalize(await resp.json());
+    } catch (_) {
+      return null;
     }
-
-    if (!fileTokens.accessToken) {
-      warn('Token file has no accessToken');
-      return;
-    }
-
-    await storeTokens(fileTokens);
-    log('Tokens bootstrapped from file');
   }
+
+  const isUsable = (t) => Boolean(t && t.accessToken && (!t.tokenExpiry || Date.now() < t.tokenExpiry));
+
+  /**
+   * Pull the newest available token into storage. Returns true if storage holds a
+   * usable (unexpired) access token afterwards.
+   */
+  let inflight = null;
+  function syncTokens() {
+    if (inflight) return inflight;
+    inflight = (async () => {
+      const stored = await browser.storage.local.get(['accessToken', 'refreshToken', 'tokenExpiry']);
+      if (stored.refreshToken) {
+        await browser.storage.local.remove('refreshToken');
+        log('Removed stored refresh token (it would log Claude Code out when rotated)');
+      }
+
+      const candidates = [await readHostTokens(), await readTokenFile()].filter(Boolean);
+      const best = candidates.sort((a, b) => (b.tokenExpiry || 0) - (a.tokenExpiry || 0))[0];
+      const current = normalize(stored);
+
+      if (best && best.accessToken !== stored.accessToken &&
+          (!isUsable(current) || (best.tokenExpiry || 0) > (current.tokenExpiry || 0))) {
+        await browser.storage.local.set({ accessToken: best.accessToken, tokenExpiry: best.tokenExpiry });
+        log('Stored newer access token from Claude Code, expires', new Date(best.tokenExpiry).toISOString());
+        return isUsable(best);
+      }
+      if (!isUsable(current)) warn('No unexpired token available. Use Claude Code once so it refreshes its login.');
+      return isUsable(current);
+    })().finally(() => { inflight = null; });
+    return inflight;
+  }
+
+  // Used by firefox-compat.js when the login button is pressed.
+  globalThis.__claudeFirefoxSyncTokens = syncTokens;
 
   // --- Patch chrome.identity.launchWebAuthFlow ---
 
@@ -134,56 +105,29 @@
     const _originalLaunchWebAuthFlow = chrome.identity.launchWebAuthFlow.bind(chrome.identity);
 
     chrome.identity.launchWebAuthFlow = function (details, callback) {
-      // Support both callback and promise styles
       const isPromise = typeof callback !== 'function';
 
       const handleResult = async (err) => {
-        // Real flow failed -- fall back to token file
-        warn('launchWebAuthFlow failed, falling back to token file:', err && err.message);
-
-        const fileTokens = await readTokenFile();
-
-        if (fileTokens && fileTokens.accessToken) {
-          await storeTokens(fileTokens);
-          log('Tokens refreshed from file after auth flow failure');
-
-          if (details && details.interactive) {
-            // Interactive calls expect a redirect URL; we can't synthesize one.
-            // Return undefined to signal the caller to re-check storage.
-            if (!isPromise) callback(undefined);
-            return undefined;
-          }
-
-          // Non-interactive (silent refresh): return undefined (silent fail)
-          if (!isPromise) callback(undefined);
-          return undefined;
-        }
-
-        // Token file also unavailable
-        if (details && details.interactive) {
-          const msg = 'Firefox OAuth redirect not supported by Anthropic. Run the Claude for Firefox installer to refresh tokens.';
+        warn('launchWebAuthFlow failed, falling back to Claude Code tokens:', err && err.message);
+        const ok = await syncTokens().catch(() => false);
+        if (!ok && details && details.interactive) {
+          const msg = 'Firefox login is not supported by Anthropic. Log in with Claude Code (`claude`); the extension uses its session.';
           if (!isPromise) {
             chrome.runtime.lastError = { message: msg };
             callback(undefined);
-          } else {
-            throw new Error(msg);
+            return undefined;
           }
-          return undefined;
+          throw new Error(msg);
         }
-
-        // Non-interactive: silent fail
+        // Callers expect a redirect URL we cannot synthesize; undefined makes them re-check storage.
         if (!isPromise) callback(undefined);
         return undefined;
       };
 
-      // Try the real flow first
       try {
         if (isPromise) {
-          return _originalLaunchWebAuthFlow(details)
-            .then((redirectUrl) => redirectUrl)
-            .catch((err) => handleResult(err));
+          return _originalLaunchWebAuthFlow(details).catch((err) => handleResult(err));
         }
-
         _originalLaunchWebAuthFlow(details, (redirectUrl) => {
           if (chrome.runtime.lastError || !redirectUrl) {
             handleResult(chrome.runtime.lastError || new Error('No redirect URL'));
@@ -199,17 +143,26 @@
     log('Patched chrome.identity.launchWebAuthFlow');
   }
 
-  // --- Initial bootstrap (delayed) ---
+  // --- Sync triggers ---
 
   setTimeout(() => {
-    ensureTokens().catch((e) => error('Initial token bootstrap failed:', e.message));
+    syncTokens().catch((e) => error('Initial token sync failed:', e.message));
   }, INITIAL_DELAY_MS);
 
-  // --- Periodic refresh ---
-
   setInterval(() => {
-    ensureTokens().catch((e) => error('Periodic token check failed:', e.message));
-  }, REFRESH_INTERVAL_MS);
+    syncTokens().catch((e) => error('Periodic token sync failed:', e.message));
+  }, SYNC_INTERVAL_MS);
+
+  // The extension deletes the access token after a 401, or writes a refresh token after its
+  // own OAuth flow; react immediately in both cases.
+  browser.storage.onChanged.addListener((changes, area) => {
+    if (area !== 'local') return;
+    const lostAccess = changes.accessToken && !changes.accessToken.newValue;
+    const gotRefresh = changes.refreshToken && changes.refreshToken.newValue;
+    if (lostAccess || gotRefresh) {
+      syncTokens().catch((e) => error('Token sync after storage change failed:', e.message));
+    }
+  });
 
   log('Token lifecycle manager initialized');
 })();

@@ -132,13 +132,6 @@ o = d.get('claudeAiOauth', {})
 print(o.get('accessToken', ''))
 " 2>/dev/null || true)"
 
-    refresh_token="$(printf '%s' "$raw_creds" | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-o = d.get('claudeAiOauth', {})
-print(o.get('refreshToken', ''))
-" 2>/dev/null || true)"
-
     expires_at="$(printf '%s' "$raw_creds" | python3 -c "
 import sys, json
 d = json.load(sys.stdin)
@@ -155,7 +148,6 @@ print(o.get('expiresAt', 0))
     cat > "$EXT_DIR/firefox-injected-tokens.json" <<TOKEOF
 {
   "accessToken": "$access_token",
-  "refreshToken": "$refresh_token",
   "expiresAt": $expires_at
 }
 TOKEOF
@@ -289,7 +281,6 @@ if [[ -z "$raw_creds" ]]; then
 fi
 
 access_token="$(printf '%s' "$raw_creds" | python3 -c "import sys,json; o=json.load(sys.stdin).get('claudeAiOauth',{}); print(o.get('accessToken',''))")"
-refresh_token="$(printf '%s' "$raw_creds" | python3 -c "import sys,json; o=json.load(sys.stdin).get('claudeAiOauth',{}); print(o.get('refreshToken',''))")"
 expires_at="$(printf '%s' "$raw_creds" | python3 -c "import sys,json; o=json.load(sys.stdin).get('claudeAiOauth',{}); print(o.get('expiresAt',0))")"
 
 if [[ -z "$access_token" ]]; then
@@ -301,7 +292,6 @@ mkdir -p "$EXT_DIR"
 cat > "$TOKEN_FILE" <<EOF
 {
   "accessToken": "$access_token",
-  "refreshToken": "$refresh_token",
   "expiresAt": $expires_at
 }
 EOF
