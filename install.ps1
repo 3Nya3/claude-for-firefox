@@ -271,7 +271,8 @@ function Create-NmhWrapper {
 @echo off
 REM Native messaging host wrapper for Claude for Firefox.
 REM Runs the bundled host, which serves its own pipe so it can run next to Claude for Chrome.
-"$NodeBin" "$InstallDir\firefox-host.mjs" 2>>"%~dp0host.log"
+REM No stderr redirect: the host appends to host.log itself, so several host processes can run at once.
+"$NodeBin" "$InstallDir\firefox-host.mjs"
 exit /b %ERRORLEVEL%
 "@
     Set-Content -Path $wrapperPath -Value $wrapperContent -Encoding ASCII

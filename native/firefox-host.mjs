@@ -3,13 +3,19 @@ import os from 'node:os';
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 const user = os.userInfo().username;
 const socketPath = process.platform === 'win32'
   ? `\\\\.\\pipe\\claude-firefox-bridge-${user}`
   : path.join(os.tmpdir(), `claude-firefox-bridge-${user}.sock`);
 
-const log = (...args) => process.stderr.write(`[Claude Firefox Host] ${args.join(' ')}\n`);
+// Append per line instead of having the wrapper redirect stderr: a redirect holds host.log open for the
+// host's lifetime, and on Windows that makes a second host (one-shot sendNativeMessage) fail to start.
+const logFile = path.join(path.dirname(fileURLToPath(import.meta.url)), 'host.log');
+const log = (...args) => {
+  try { fs.appendFileSync(logFile, `[Claude Firefox Host] ${args.join(' ')}\n`); } catch (_) {}
+};
 const frame = (message) => {
   const body = Buffer.from(JSON.stringify(message), 'utf8');
   const header = Buffer.alloc(4);
