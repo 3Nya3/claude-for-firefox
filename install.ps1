@@ -478,6 +478,10 @@ function Main {
 
     # Copy extension files if available
     $srcExtDir = $PSScriptRoot
+    # Start from a clean copy so files from an older release (hashed asset names) don't linger.
+    # The token file is kept; it is rewritten below anyway.
+    Get-ChildItem -Path $ExtDir -Force | Where-Object { $_.Name -ne 'firefox-injected-tokens.json' } |
+        Remove-Item -Recurse -Force
     $exclude = @('.git','.gm','.agentplug-kv','node_modules','web-ext-artifacts','install.ps1','install.sh','native','README.md','.gitignore')
     Get-ChildItem -Path $srcExtDir -Force | Where-Object { $exclude -notcontains $_.Name -and $_.Name -ne 'firefox-injected-tokens.json' } | ForEach-Object {
         Copy-Item -Path $_.FullName -Destination $ExtDir -Recurse -Force

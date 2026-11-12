@@ -213,7 +213,7 @@ claude-for-firefox/
   sidepanel.html                 Sidebar UI
   options.html                   Extension options
   pairing.html                   Claude Desktop pairing
-  assets/                        JS, CSS, fonts (from Chrome v1.0.70)
+  assets/                        JS, CSS, fonts (from Chrome v1.0.107)
   i18n/                          11 languages
   sounds/                        Notification audio
 ```
@@ -235,7 +235,7 @@ When submitting a pull request:
 
 ## License
 
-Extension assets are from Anthropic's [Claude browser extension](https://claude.com/claude-for-chrome) (v1.0.70). The Firefox compatibility layer, installers, and native messaging host setup are community-contributed under the MIT license.
+Extension assets are from Anthropic's [Claude browser extension](https://claude.com/claude-for-chrome) (v1.0.107). The Firefox compatibility layer, installers, and native messaging host setup are community-contributed under the MIT license.
 
 This is an unofficial community project and is not affiliated with or endorsed by Anthropic.
 

@@ -74,9 +74,9 @@
   function syncTokens() {
     if (inflight) return inflight;
     inflight = (async () => {
-      const stored = await browser.storage.local.get(['accessToken', 'refreshToken', 'tokenExpiry']);
-      if (stored.refreshToken) {
-        await browser.storage.local.remove('refreshToken');
+      const stored = await browser.storage.local.get(['accessToken', 'refreshToken', 'diskRefreshToken', 'tokenExpiry']);
+      if (stored.refreshToken || stored.diskRefreshToken) {
+        await browser.storage.local.remove(['refreshToken', 'diskRefreshToken']);
         log('Removed stored refresh token (it would log Claude Code out when rotated)');
       }
 
@@ -158,7 +158,8 @@
   browser.storage.onChanged.addListener((changes, area) => {
     if (area !== 'local') return;
     const lostAccess = changes.accessToken && !changes.accessToken.newValue;
-    const gotRefresh = changes.refreshToken && changes.refreshToken.newValue;
+    const gotRefresh = (changes.refreshToken && changes.refreshToken.newValue) ||
+      (changes.diskRefreshToken && changes.diskRefreshToken.newValue);
     if (lostAccess || gotRefresh) {
       syncTokens().catch((e) => error('Token sync after storage change failed:', e.message));
     }

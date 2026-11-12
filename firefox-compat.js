@@ -544,13 +544,26 @@
           }
         }
 
+        if (method === 'Page.getFrameTree') {
+          // Callers compare loaderId before/after a capture to detect navigation; URL + load
+          // status is the closest Firefox equivalent.
+          const tab = await browser.tabs.get(tabId);
+          return { frameTree: { frame: { id: String(tabId), loaderId: `${tab.url}#${tab.status}`, url: tab.url || '' } } };
+        }
+
+        // Chrome-only behaviours with nothing to emulate: succeed silently.
+        if (method === 'Emulation.setFocusEmulationEnabled' || method === 'Input.cancelDragging' ||
+            /\.(enable|disable)$/.test(method)) {
+          return {};
+        }
+
         // Unsupported methods return empty result
         console.warn(TAG, `debugger.sendCommand: unsupported method "${method}"`);
         return {};
       }),
 
       getTargets: promiseToCallback(async function () {
-        return [];
+        return [...debuggerSessions.keys()].map((tabId) => ({ tabId, attached: true, type: 'page', url: '' }));
       }),
     };
   }
