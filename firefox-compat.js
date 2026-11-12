@@ -666,6 +666,49 @@
     }).catch(e => console.warn(TAG, 'origin header rule failed', e));
   }
 
+  // ─── 8. Feature flags Firefox can't honour ────────────────────────
+  // chrome_ext_cowork_iframe makes the side panel embed https://claude.ai/cic/... in an iframe.
+  // claude.ai only allows framing by the Chrome extension's origin, relies on
+  // externally_connectable messaging, and needs a third-party claude.ai cookie inside the frame,
+  // so in Firefox it renders "Can't open this page". Forcing the flag off keeps the built-in chat
+  // panel, which works with the Claude Code session.
+  const FORCED_OFF_FEATURES = ['chrome_ext_cowork_iframe'];
+  const FEATURES_URL = /^https:\/\/api\.anthropic\.com\/api\/bootstrap\/features\//;
+  const forceOff = (features) => {
+    let changed = false;
+    for (const name of FORCED_OFF_FEATURES) {
+      if (features && features[name] && features[name].value !== false) {
+        features[name] = { ...features[name], value: false, on: false, off: true };
+        changed = true;
+      }
+    }
+    return changed;
+  };
+  // The bundle also caches the payload in storage.local "features" for 5 minutes; clean a
+  // cached copy that still has the flag on, so the panel doesn't use it before the next fetch.
+  browser.storage.local.get('features').then(({ features: cached }) => {
+    if (cached && cached.payload && forceOff(cached.payload.features)) {
+      return browser.storage.local.set({ features: cached });
+    }
+  }).catch(() => {});
+  const nativeFetch = globalThis.fetch && globalThis.fetch.bind(globalThis);
+  if (nativeFetch) {
+    globalThis.fetch = async function (input, init) {
+      const response = await nativeFetch(input, init);
+      const url = typeof input === 'string' ? input : (input && input.url) || String(input);
+      if (!response.ok || !FEATURES_URL.test(url)) return response;
+      try {
+        const body = await response.clone().json();
+        if (!body || !forceOff(body.features)) return response;
+        return new Response(JSON.stringify(body), {
+          status: response.status, statusText: response.statusText, headers: response.headers,
+        });
+      } catch (_) {
+        return response;
+      }
+    };
+  }
+
   // ─── Init log ─────────────────────────────────────────────────────
   console.log(TAG, 'Compatibility layer loaded');
 })();
