@@ -26,19 +26,12 @@
     return;
   }
 
-  chrome.action.onClicked.addListener(function (tab) {
-    var tabId = tab && tab.id;
-
-    // Set the sidebar panel URL with the tabId parameter so the panel
-    // knows which tab context it belongs to.
-    if (sidebarApi.setPanel) {
-      var panelUrl = chrome.runtime.getURL('side-panel.html');
-      if (tabId) {
-        panelUrl += '?tabId=' + encodeURIComponent(tabId);
-      }
-      sidebarApi.setPanel({ panel: panelUrl });
-    }
-
+  // The bundle's own onClicked listener sets this tab's panel to sidepanel.html?tabId=<tab>
+  // (chrome.sidePanel.setOptions -> sidebarAction.setPanel with tabId). Don't set a global
+  // panel here: it would bind every other tab's sidebar to the clicked tab. Tabs without a
+  // per-tab panel load the default sidepanel.html, which binds itself to the active tab
+  // (firefox-sidepanel-loader.js).
+  chrome.action.onClicked.addListener(function () {
     // Toggle sidebar visibility
     if (sidebarApi.toggle) {
       sidebarApi.toggle();
