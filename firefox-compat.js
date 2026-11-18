@@ -704,11 +704,27 @@
       return browser.storage.local.set({ features: cached });
     }
   }).catch(() => {});
+  // ─── 9. Surface API errors the bundle hides ───────────────────────
+  // The chat collapses every 429 into "Usage limit reached" (and other failures into
+  // nothing at all), dropping the server's message. Log the real response so it can be
+  // read from about:debugging → Inspect.
+  const MESSAGES_URL = /^https:\/\/api\.anthropic\.com\/v1\/messages(\?|$)/;
+  function logApiError(url, response) {
+    const headers = {};
+    response.headers.forEach((value, name) => {
+      if (/ratelimit|retry-after|request-id/i.test(name)) headers[name] = value;
+    });
+    response.clone().text()
+      .then(body => console.warn(TAG, `API ${response.status} from ${url}`, headers, body.slice(0, 2000)))
+      .catch(() => console.warn(TAG, `API ${response.status} from ${url}`, headers));
+  }
+
   const nativeFetch = globalThis.fetch && globalThis.fetch.bind(globalThis);
   if (nativeFetch) {
     globalThis.fetch = async function (input, init) {
       const response = await nativeFetch(input, init);
       const url = typeof input === 'string' ? input : (input && input.url) || String(input);
+      if (!response.ok && MESSAGES_URL.test(url)) logApiError(url, response);
       if (!response.ok || !FEATURES_URL.test(url)) return response;
       try {
         const body = await response.clone().json();
