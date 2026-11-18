@@ -545,10 +545,28 @@
         }
 
         if (method === 'Page.captureScreenshot') {
+          const params = commandParams || {};
+          const details = { format: params.format === 'jpeg' ? 'jpeg' : 'png' };
+          if (details.format === 'jpeg' && typeof params.quality === 'number') details.quality = params.quality;
+          // The bundle asks for the viewport (clip in CSS px, at the scroll offset) rendered at
+          // its target size via clip.scale; CDP's output is clip size × scale × devicePixelRatio.
+          // Firefox can render a page area at any scale, so produce that size directly. Returning
+          // the full-DPR capture instead fails the bundle's size check, and its fallback shrinks
+          // the image ~3x in one canvas step, dropping pixel rows (faded, broken text).
+          const clip = params.clip;
+          if (clip && clip.width > 0 && clip.height > 0) {
+            let dpr = null;
+            try {
+              const [probe] = await browser.scripting.executeScript({ target: { tabId }, func: () => window.devicePixelRatio });
+              dpr = probe && probe.result;
+            } catch (_) { /* page can't run scripts: capture as-is */ }
+            if (dpr) {
+              details.rect = { x: clip.x || 0, y: clip.y || 0, width: clip.width, height: clip.height };
+              details.scale = (clip.scale || 1) * dpr;
+            }
+          }
           try {
-            const dataUrl = await browser.tabs.captureTab(tabId, {
-              format: (commandParams && commandParams.format) || 'png',
-            });
+            const dataUrl = await browser.tabs.captureTab(tabId, details);
             // Strip "data:image/...;base64," prefix
             const base64 = dataUrl.replace(/^data:[^;]+;base64,/, '');
             return { data: base64 };
