@@ -35,6 +35,8 @@
     "activeTab",
     "scripting",
     "tabs",
+    "tabGroups",
+    "menus",
     "alarms",
     "notifications",
     "webNavigation",

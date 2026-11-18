@@ -82,108 +82,6 @@
     };
   }
 
-  // ─── 2. chrome.tabGroups polyfill ─────────────────────────────────
-  const TAB_GROUP_COLORS = Object.freeze([
-    'grey', 'blue', 'red', 'yellow', 'green', 'pink', 'purple', 'cyan', 'orange',
-  ]);
-
-  // In-memory group cache: groupId → { id, title, color, collapsed, windowId }
-  let groupCache = new Map();
-  // tabId → groupId
-  let tabGroupMap = new Map();
-  let nextGroupId = 1;
-  let cacheLoaded = false;
-
-  async function loadGroupCache() {
-    if (cacheLoaded) return;
-    try {
-      const data = await browser.storage.local.get(STORAGE_KEY);
-      const saved = data[STORAGE_KEY];
-      if (saved) {
-        groupCache = new Map(saved.groups || []);
-        tabGroupMap = new Map(saved.tabMap || []);
-        nextGroupId = saved.nextId || 1;
-      }
-    } catch (_) { /* first run, empty cache */ }
-    cacheLoaded = true;
-  }
-
-  async function persistGroupCache() {
-    try {
-      await browser.storage.local.set({
-        [STORAGE_KEY]: {
-          groups: [...groupCache.entries()],
-          tabMap: [...tabGroupMap.entries()],
-          nextId: nextGroupId,
-        },
-      });
-    } catch (_) { /* best-effort */ }
-  }
-
-  function makeGroup(windowId) {
-    const id = nextGroupId++;
-    const group = { id, title: '', color: 'grey', collapsed: false, windowId: windowId || -1 };
-    groupCache.set(id, group);
-    return group;
-  }
-
-  function matchesQuery(group, query) {
-    if (!query) return true;
-    if (query.collapsed !== undefined && group.collapsed !== query.collapsed) return false;
-    if (query.color !== undefined && group.color !== query.color) return false;
-    if (query.title !== undefined && group.title !== query.title) return false;
-    if (query.windowId !== undefined && query.windowId !== -2 && group.windowId !== query.windowId) return false;
-    return true;
-  }
-
-  chrome.tabGroups = {
-    TAB_GROUP_ID_NONE,
-    Color: TAB_GROUP_COLORS.reduce((o, c) => { o[c.toUpperCase()] = c; return o; }, {}),
-
-    get: promiseToCallback(async function (groupId) {
-      await loadGroupCache();
-      const g = groupCache.get(groupId);
-      if (!g) throw new Error(`No group with id: ${groupId}`);
-      return { ...g };
-    }),
-
-    query: promiseToCallback(async function (queryInfo) {
-      await loadGroupCache();
-      const results = [];
-      for (const g of groupCache.values()) {
-        if (matchesQuery(g, queryInfo)) results.push({ ...g });
-      }
-      return results;
-    }),
-
-    update: promiseToCallback(async function (groupId, updateProperties) {
-      await loadGroupCache();
-      const g = groupCache.get(groupId);
-      if (!g) throw new Error(`No group with id: ${groupId}`);
-      if (updateProperties.title !== undefined) g.title = updateProperties.title;
-      if (updateProperties.color !== undefined) g.color = updateProperties.color;
-      if (updateProperties.collapsed !== undefined) g.collapsed = updateProperties.collapsed;
-      groupCache.set(groupId, g);
-      await persistGroupCache();
-      return { ...g };
-    }),
-
-    move: promiseToCallback(async function (groupId, moveProperties) {
-      await loadGroupCache();
-      const g = groupCache.get(groupId);
-      if (!g) throw new Error(`No group with id: ${groupId}`);
-      if (moveProperties && moveProperties.windowId !== undefined) g.windowId = moveProperties.windowId;
-      groupCache.set(groupId, g);
-      await persistGroupCache();
-      return { ...g };
-    }),
-
-    onCreated: makeEvent(),
-    onUpdated: makeEvent(),
-    onRemoved: makeEvent(),
-    onMoved: makeEvent(),
-  };
-
   // Firefox rejects about:newtab / chrome://newtab as an explicit URL; omitting it opens the default new tab
   const NEWTAB_URL = /^(about:newtab\/?|chrome:\/\/newtab\/?)$/;
   function withoutNewtabUrl(info) {
@@ -215,95 +113,210 @@
     return nativeWindowsCreate(withoutNewtabUrl(info));
   });
 
-  // Patch chrome.tabs.group
-  const nativeTabsGet = browser.tabs.get.bind(browser.tabs);
-  const nativeTabsQuery = browser.tabs.query.bind(browser.tabs);
-  const origTabsGroup = chrome.tabs.group;
-  chrome.tabs.group = promiseToCallback(async function (options) {
-    await loadGroupCache();
-    let groupId = options.groupId;
-    if (groupId === undefined || groupId === null) {
-      const tabIds = Array.isArray(options.tabIds) ? options.tabIds : [options.tabIds];
-      let windowId = -1;
-      if (tabIds.length > 0) {
-        try {
-          const t = await nativeTabsGet(tabIds[0]);
-          windowId = t.windowId;
-        } catch (_) { /* fallback */ }
-      }
-      const g = makeGroup(windowId);
-      groupId = g.id;
-      chrome.tabGroups.onCreated._fire({ ...g });
-    }
-    const tabIds = Array.isArray(options.tabIds) ? options.tabIds : [options.tabIds];
-    for (const tid of tabIds) {
-      tabGroupMap.set(tid, groupId);
-    }
-    await persistGroupCache();
-    return groupId;
-  });
+  // ─── 2. Tab groups ───────────────────────────────────────────────
+  // Firefox 139+ has real tab groups (tabs.group/ungroup, Tab.groupId, the tabGroups
+  // namespace). Use them: the agent's "Claude (MCP)" group is then a visible Firefox tab
+  // group, and dragging a tab into it lets the agent use that tab, as in Chrome.
+  // Older Firefox falls back to an in-memory polyfill that only this extension can see.
+  const NATIVE_TAB_GROUPS = Boolean(browser.tabGroups && typeof browser.tabs.group === 'function');
+  if (NATIVE_TAB_GROUPS && !chrome.tabGroups.Color) {
+    chrome.tabGroups.Color = Object.freeze(['grey', 'blue', 'red', 'yellow', 'green', 'pink', 'purple', 'cyan', 'orange']
+      .reduce((o, c) => { o[c.toUpperCase()] = c; return o; }, {}));
+  }
 
-  // Patch chrome.tabs.ungroup
-  const origTabsUngroup = chrome.tabs.ungroup;
-  chrome.tabs.ungroup = promiseToCallback(async function (tabIds) {
-    await loadGroupCache();
-    const ids = Array.isArray(tabIds) ? tabIds : [tabIds];
-    for (const tid of ids) {
-      tabGroupMap.delete(tid);
-    }
-    // Clean up empty groups
-    const usedGroups = new Set(tabGroupMap.values());
-    for (const gid of [...groupCache.keys()]) {
-      if (!usedGroups.has(gid)) {
-        const removed = groupCache.get(gid);
-        groupCache.delete(gid);
-        if (removed) chrome.tabGroups.onRemoved._fire({ ...removed });
-      }
-    }
-    await persistGroupCache();
-  });
+  if (!NATIVE_TAB_GROUPS) {
+    const TAB_GROUP_COLORS = Object.freeze([
+      'grey', 'blue', 'red', 'yellow', 'green', 'pink', 'purple', 'cyan', 'orange',
+    ]);
 
-  // Patch chrome.tabs.get to include groupId
-  chrome.tabs.get = promiseToCallback(async function (tabId) {
-    const tab = await nativeTabsGet(tabId);
-    await loadGroupCache();
-    tab.groupId = tabGroupMap.get(tabId) ?? TAB_GROUP_ID_NONE;
-    return tab;
-  });
+    // In-memory group cache: groupId → { id, title, color, collapsed, windowId }
+    let groupCache = new Map();
+    // tabId → groupId
+    let tabGroupMap = new Map();
+    let nextGroupId = 1;
+    let cacheLoaded = false;
 
-  // Patch chrome.tabs.query to include groupId and support groupId filter
-  chrome.tabs.query = promiseToCallback(async function (queryInfo) {
-    const filterGroupId = queryInfo ? queryInfo.groupId : undefined;
-    const cleanQuery = { ...queryInfo };
-    delete cleanQuery.groupId;
-    const tabs = await nativeTabsQuery(cleanQuery);
-    await loadGroupCache();
-    for (const tab of tabs) {
-      tab.groupId = tabGroupMap.get(tab.id) ?? TAB_GROUP_ID_NONE;
+    async function loadGroupCache() {
+      if (cacheLoaded) return;
+      try {
+        const data = await browser.storage.local.get(STORAGE_KEY);
+        const saved = data[STORAGE_KEY];
+        if (saved) {
+          groupCache = new Map(saved.groups || []);
+          tabGroupMap = new Map(saved.tabMap || []);
+          nextGroupId = saved.nextId || 1;
+        }
+      } catch (_) { /* first run, empty cache */ }
+      cacheLoaded = true;
     }
-    if (filterGroupId !== undefined) {
-      return tabs.filter(t => t.groupId === filterGroupId);
-    }
-    return tabs;
-  });
 
-  // Auto-cleanup when tabs are removed
-  if (browser.tabs && browser.tabs.onRemoved) {
-    browser.tabs.onRemoved.addListener(async (tabId) => {
+    async function persistGroupCache() {
+      try {
+        await browser.storage.local.set({
+          [STORAGE_KEY]: {
+            groups: [...groupCache.entries()],
+            tabMap: [...tabGroupMap.entries()],
+            nextId: nextGroupId,
+          },
+        });
+      } catch (_) { /* best-effort */ }
+    }
+
+    function makeGroup(windowId) {
+      const id = nextGroupId++;
+      const group = { id, title: '', color: 'grey', collapsed: false, windowId: windowId || -1 };
+      groupCache.set(id, group);
+      return group;
+    }
+
+    function matchesQuery(group, query) {
+      if (!query) return true;
+      if (query.collapsed !== undefined && group.collapsed !== query.collapsed) return false;
+      if (query.color !== undefined && group.color !== query.color) return false;
+      if (query.title !== undefined && group.title !== query.title) return false;
+      if (query.windowId !== undefined && query.windowId !== -2 && group.windowId !== query.windowId) return false;
+      return true;
+    }
+
+    chrome.tabGroups = {
+      TAB_GROUP_ID_NONE,
+      Color: TAB_GROUP_COLORS.reduce((o, c) => { o[c.toUpperCase()] = c; return o; }, {}),
+
+      get: promiseToCallback(async function (groupId) {
+        await loadGroupCache();
+        const g = groupCache.get(groupId);
+        if (!g) throw new Error(`No group with id: ${groupId}`);
+        return { ...g };
+      }),
+
+      query: promiseToCallback(async function (queryInfo) {
+        await loadGroupCache();
+        const results = [];
+        for (const g of groupCache.values()) {
+          if (matchesQuery(g, queryInfo)) results.push({ ...g });
+        }
+        return results;
+      }),
+
+      update: promiseToCallback(async function (groupId, updateProperties) {
+        await loadGroupCache();
+        const g = groupCache.get(groupId);
+        if (!g) throw new Error(`No group with id: ${groupId}`);
+        if (updateProperties.title !== undefined) g.title = updateProperties.title;
+        if (updateProperties.color !== undefined) g.color = updateProperties.color;
+        if (updateProperties.collapsed !== undefined) g.collapsed = updateProperties.collapsed;
+        groupCache.set(groupId, g);
+        await persistGroupCache();
+        return { ...g };
+      }),
+
+      move: promiseToCallback(async function (groupId, moveProperties) {
+        await loadGroupCache();
+        const g = groupCache.get(groupId);
+        if (!g) throw new Error(`No group with id: ${groupId}`);
+        if (moveProperties && moveProperties.windowId !== undefined) g.windowId = moveProperties.windowId;
+        groupCache.set(groupId, g);
+        await persistGroupCache();
+        return { ...g };
+      }),
+
+      onCreated: makeEvent(),
+      onUpdated: makeEvent(),
+      onRemoved: makeEvent(),
+      onMoved: makeEvent(),
+    };
+
+    // Patch chrome.tabs.group
+    const nativeTabsGet = browser.tabs.get.bind(browser.tabs);
+    const nativeTabsQuery = browser.tabs.query.bind(browser.tabs);
+    const origTabsGroup = chrome.tabs.group;
+    chrome.tabs.group = promiseToCallback(async function (options) {
       await loadGroupCache();
-      if (tabGroupMap.has(tabId)) {
-        const gid = tabGroupMap.get(tabId);
-        tabGroupMap.delete(tabId);
-        // Remove group if now empty
-        const usedGroups = new Set(tabGroupMap.values());
+      let groupId = options.groupId;
+      if (groupId === undefined || groupId === null) {
+        const tabIds = Array.isArray(options.tabIds) ? options.tabIds : [options.tabIds];
+        let windowId = -1;
+        if (tabIds.length > 0) {
+          try {
+            const t = await nativeTabsGet(tabIds[0]);
+            windowId = t.windowId;
+          } catch (_) { /* fallback */ }
+        }
+        const g = makeGroup(windowId);
+        groupId = g.id;
+        chrome.tabGroups.onCreated._fire({ ...g });
+      }
+      const tabIds = Array.isArray(options.tabIds) ? options.tabIds : [options.tabIds];
+      for (const tid of tabIds) {
+        tabGroupMap.set(tid, groupId);
+      }
+      await persistGroupCache();
+      return groupId;
+    });
+
+    // Patch chrome.tabs.ungroup
+    const origTabsUngroup = chrome.tabs.ungroup;
+    chrome.tabs.ungroup = promiseToCallback(async function (tabIds) {
+      await loadGroupCache();
+      const ids = Array.isArray(tabIds) ? tabIds : [tabIds];
+      for (const tid of ids) {
+        tabGroupMap.delete(tid);
+      }
+      // Clean up empty groups
+      const usedGroups = new Set(tabGroupMap.values());
+      for (const gid of [...groupCache.keys()]) {
         if (!usedGroups.has(gid)) {
           const removed = groupCache.get(gid);
           groupCache.delete(gid);
           if (removed) chrome.tabGroups.onRemoved._fire({ ...removed });
         }
-        await persistGroupCache();
       }
+      await persistGroupCache();
     });
+
+    // Patch chrome.tabs.get to include groupId
+    chrome.tabs.get = promiseToCallback(async function (tabId) {
+      const tab = await nativeTabsGet(tabId);
+      await loadGroupCache();
+      tab.groupId = tabGroupMap.get(tabId) ?? TAB_GROUP_ID_NONE;
+      return tab;
+    });
+
+    // Patch chrome.tabs.query to include groupId and support groupId filter
+    chrome.tabs.query = promiseToCallback(async function (queryInfo) {
+      const filterGroupId = queryInfo ? queryInfo.groupId : undefined;
+      const cleanQuery = { ...queryInfo };
+      delete cleanQuery.groupId;
+      const tabs = await nativeTabsQuery(cleanQuery);
+      await loadGroupCache();
+      for (const tab of tabs) {
+        tab.groupId = tabGroupMap.get(tab.id) ?? TAB_GROUP_ID_NONE;
+      }
+      if (filterGroupId !== undefined) {
+        return tabs.filter(t => t.groupId === filterGroupId);
+      }
+      return tabs;
+    });
+
+    // Auto-cleanup when tabs are removed
+    if (browser.tabs && browser.tabs.onRemoved) {
+      browser.tabs.onRemoved.addListener(async (tabId) => {
+        await loadGroupCache();
+        if (tabGroupMap.has(tabId)) {
+          const gid = tabGroupMap.get(tabId);
+          tabGroupMap.delete(tabId);
+          // Remove group if now empty
+          const usedGroups = new Set(tabGroupMap.values());
+          if (!usedGroups.has(gid)) {
+            const removed = groupCache.get(gid);
+            groupCache.delete(gid);
+            if (removed) chrome.tabGroups.onRemoved._fire({ ...removed });
+          }
+          await persistGroupCache();
+        }
+      });
+    }
+
   }
 
   // ─── 3. chrome.offscreen ──────────────────────────────────────────

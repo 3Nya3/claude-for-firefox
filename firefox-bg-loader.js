@@ -8,5 +8,6 @@ import './firefox-offscreen-shim.js';
 import './firefox-oauth-interceptor.js';
 import './firefox-token-injector.js';
 import './firefox-action-handler.js';
+import './firefox-mcp-tab-group.js';
 // Chrome's own loader always has this name; it imports the hashed bundle for the current release.
 import './service-worker-loader.js';
