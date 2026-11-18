@@ -9,27 +9,71 @@ const socketPath = process.platform === 'win32'
   : path.join(os.tmpdir(), `claude-firefox-bridge-${user}.sock`);
 const CALL_TIMEOUT_MS = 120000;
 
+// Parameter types for the common arguments. Without them, MCP clients only see an untyped
+// object and may send arrays and numbers as JSON text ("[587, 617]"), which the extension
+// rejects ("coordinate: expected tuple, received string"). Unlisted arguments still pass through.
+const tabId = { type: 'integer', description: 'Tab id from tabs_context_mcp.' };
+const point = { type: 'array', items: { type: 'number' }, minItems: 2, maxItems: 2, description: '[x, y] in screenshot pixels.' };
+const schema = (properties = {}, required = []) => ({ type: 'object', properties, required, additionalProperties: true });
+
 const TOOLS = {
-  tabs_context_mcp: 'List the tabs in the Firefox Claude tab group. Call first; pass createIfEmpty:true to create one.',
-  tabs_create_mcp: 'Open a new empty tab in the Firefox Claude tab group.',
-  tabs_close_mcp: 'Close a tab in the Firefox Claude tab group.',
-  navigate: 'Navigate a Firefox tab to a URL ({url, tabId}).',
-  computer: 'Mouse, keyboard and screenshot actions on a Firefox tab ({action, tabId, ...}).',
-  read_page: 'Accessibility tree of a Firefox tab ({tabId, filter?}).',
-  get_page_text: 'Plain text of a Firefox tab ({tabId}).',
-  find: 'Find elements on a Firefox tab from a natural language query ({tabId, query}).',
-  form_input: 'Set a form field value on a Firefox tab ({tabId, ref, value}).',
-  javascript_tool: 'Run JavaScript in a Firefox tab ({tabId, action:"javascript_exec", text}).',
-  read_console_messages: 'Read console messages from a Firefox tab.',
-  read_network_requests: 'Read network requests from a Firefox tab.',
-  resize_window: 'Resize the Firefox window.',
-  file_upload: 'Upload files to a file input in a Firefox tab.',
-  upload_image: 'Upload an image to a Firefox tab.',
-  gif_creator: 'Record and export a GIF of Firefox browser actions.',
-  browser_batch: 'Run several Firefox browser actions in one call.',
-  shortcuts_list: 'List available shortcuts.',
-  shortcuts_execute: 'Execute a shortcut.',
+  tabs_context_mcp: ['List the tabs in the Firefox Claude tab group. Call first; pass createIfEmpty:true to create one.',
+    schema({ createIfEmpty: { type: 'boolean' } })],
+  tabs_create_mcp: ['Open a new empty tab in the Firefox Claude tab group.', schema()],
+  tabs_close_mcp: ['Close a tab in the Firefox Claude tab group.', schema({ tabId }, ['tabId'])],
+  navigate: ['Navigate a Firefox tab to a URL, or "back"/"forward".', schema({ tabId, url: { type: 'string' } }, ['tabId', 'url'])],
+  computer: ['Mouse, keyboard and screenshot actions on a Firefox tab.', schema({
+    tabId,
+    action: { type: 'string', enum: ['left_click', 'right_click', 'double_click', 'triple_click', 'type', 'key', 'screenshot', 'wait', 'scroll', 'scroll_to', 'left_click_drag', 'zoom', 'hover'] },
+    coordinate: point,
+    start_coordinate: point,
+    region: { type: 'array', items: { type: 'number' }, minItems: 4, maxItems: 4, description: '[x0, y0, x1, y1] for zoom.' },
+    text: { type: 'string' },
+    ref: { type: 'string' },
+    modifiers: { type: 'string' },
+    scroll_direction: { type: 'string', enum: ['up', 'down', 'left', 'right'] },
+    scroll_amount: { type: 'number' },
+    duration: { type: 'number' },
+    repeat: { type: 'number' },
+  }, ['action', 'tabId'])],
+  read_page: ['Accessibility tree of a Firefox tab.', schema({ tabId, filter: { type: 'string' }, depth: { type: 'number' }, ref_id: { type: 'string' } }, ['tabId'])],
+  get_page_text: ['Plain text of a Firefox tab.', schema({ tabId }, ['tabId'])],
+  find: ['Find elements on a Firefox tab from a natural language query.', schema({ tabId, query: { type: 'string' } }, ['tabId', 'query'])],
+  form_input: ['Set a form field value on a Firefox tab.', schema({ tabId, ref: { type: 'string' }, value: {} }, ['tabId', 'ref', 'value'])],
+  javascript_tool: ['Run JavaScript in a Firefox tab.', schema({ tabId, action: { type: 'string', enum: ['javascript_exec'] }, text: { type: 'string' } }, ['tabId', 'text'])],
+  read_console_messages: ['Read console messages from a Firefox tab.', schema({ tabId })],
+  read_network_requests: ['Read network requests from a Firefox tab.', schema({ tabId })],
+  resize_window: ['Resize the Firefox window.', schema({ tabId, width: { type: 'number' }, height: { type: 'number' } })],
+  file_upload: ['Upload files to a file input in a Firefox tab.', schema({ tabId })],
+  upload_image: ['Upload an image to a Firefox tab.', schema({ tabId })],
+  gif_creator: ['Record and export a GIF of Firefox browser actions.', schema({ tabId })],
+  browser_batch: ['Run several Firefox browser actions in one call.',
+    schema({ actions: { type: 'array', items: { type: 'object', properties: { name: { type: 'string' }, input: { type: 'object' } } } } }, ['actions'])],
+  shortcuts_list: ['List available shortcuts.', schema()],
+  shortcuts_execute: ['Execute a shortcut.', schema()],
 };
+
+// Arguments that must not be strings. Clients that ignore the schema may still send them as
+// JSON text; parse those back. Free-text arguments (text, query, url, ...) are left alone.
+const NON_STRING_ARGS = new Set(['coordinate', 'start_coordinate', 'region', 'tabId', 'scroll_amount', 'duration',
+  'repeat', 'width', 'height', 'depth', 'createIfEmpty', 'actions', 'input']);
+function coerceArgs(args) {
+  if (!args || typeof args !== 'object' || Array.isArray(args)) return args;
+  const out = { ...args };
+  for (const [key, value] of Object.entries(out)) {
+    if (NON_STRING_ARGS.has(key) && typeof value === 'string') {
+      try { out[key] = JSON.parse(value); } catch { /* leave it for the extension to report */ }
+    }
+  }
+  // browser_batch: each action is { name, input }, where input may itself be JSON text.
+  if (Array.isArray(out.actions)) {
+    out.actions = out.actions.map((action) => {
+      const parsed = coerceArgs(action);
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? { ...parsed, input: coerceArgs(parsed.input) } : parsed;
+    });
+  }
+  return out;
+}
 
 const callFirefox = (tool, args) => new Promise((resolve, reject) => {
   const socket = net.connect(socketPath);
@@ -66,15 +110,11 @@ const callTool = async (name, args) => {
 const methods = {
   initialize: () => ({ protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'firefox', version: '1.0.0' } }),
   'tools/list': () => ({
-    tools: Object.entries(TOOLS).map(([name, description]) => ({
-      name,
-      description,
-      inputSchema: { type: 'object', additionalProperties: true },
-    })),
+    tools: Object.entries(TOOLS).map(([name, [description, inputSchema]]) => ({ name, description, inputSchema })),
   }),
   'tools/call': ({ name, arguments: args }) => {
     if (!TOOLS[name]) throw new Error(`Unknown tool: ${name}`);
-    return callTool(name, args);
+    return callTool(name, coerceArgs(args));
   },
   ping: () => ({}),
 };
